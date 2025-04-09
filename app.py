@@ -298,78 +298,104 @@ def admin():
 
     return render_template('admin.html', peliculas=peliculas, generos=generos)
 
-
 @app.route('/admin/peliculas/agregar', methods=['POST'])
 @login_required # Aplicar decorador
 def agregar_pelicula():
     # La verificación de sesión ya la hace el decorador
-    imagen = request.files.get('imagen')
+
+    # --- 1. Obtener TODOS los datos del formulario ---
+    titulo = request.form.get('titulo')
+    horarios = request.form.get('horarios')
+    sinopsis = request.form.get('sinopsis') # Podría ser opcional
+    trailer_url = request.form.get('trailer_url') # Podría ser opcional
+    fecha_estreno_val = request.form.get('fecha_estreno') or None
+    genero_id_str = request.form.get('genero_id') or None # Obtener como string primero
+
+    imagen = request.files.get('imagen') # Obtener archivo de imagen
+
+    # --- 2. Validar campos de texto REQUERIDOS ---
+    #    (Añade aquí todos los campos que NO pueden estar vacíos o ser solo espacios)
+    if not titulo or not titulo.strip():
+        flash('El campo "Título" es obligatorio y no puede contener solo espacios.', 'error')
+        return redirect(url_for('admin')) # Detiene y redirige
+
+    if not horarios or not horarios.strip():
+        flash('El campo "Horarios" es obligatorio y no puede contener solo espacios.', 'error')
+        return redirect(url_for('admin')) # Detiene y redirige
+
+    # --- OPCIONAL: Validar otros campos si son obligatorios ---
+    # if not sinopsis or not sinopsis.strip():
+    #    flash('El campo "Sinopsis" es obligatorio...', 'error')
+    #    return redirect(url_for('admin'))
+    # if not trailer_url or not trailer_url.strip():
+    #     flash('El campo "URL Tráiler" es obligatorio...', 'error')
+    #     return redirect(url_for('admin'))
+    if not genero_id_str: # Validar que se seleccionó un género
+         flash('Debes seleccionar un género.', 'error')
+         return redirect(url_for('admin'))
+    # --------------------------------------------------
+
+    # --- 3. Validar y procesar imagen (código existente) ---
     filepath = None # Ruta absoluta para guardar/borrar archivo, inicializar a None
     imagen_ruta = None # Ruta relativa URL para BD, inicializar a None
 
-    # Validaciones iniciales
     if not imagen or imagen.filename == '':
         flash('No se seleccionó ningún archivo de imagen válido.', 'error')
         return redirect(url_for('admin'))
     if not allowed_file(imagen.filename):
         flash('Formato de imagen no permitido.', 'error')
         return redirect(url_for('admin'))
-    # Verificar si la carpeta de uploads es válida (se definió al inicio)
     if not UPLOAD_FOLDER_FILESYSTEM:
-         flash('Error interno: La configuración de la carpeta de subida no es válida.', 'error')
-         return redirect(url_for('admin'))
+        flash('Error interno: La configuración de la carpeta de subida no es válida.', 'error')
+        return redirect(url_for('admin'))
 
-    # Procesar y guardar imagen
+    # Procesar y guardar imagen (intenta esto ANTES de la BD)
     try:
         filename = str(uuid.uuid4()) + '.' + imagen.filename.rsplit('.', 1)[1].lower()
-        # Usar la ruta absoluta del sistema para guardar
         filepath = os.path.join(UPLOAD_FOLDER_FILESYSTEM, filename)
-        # Usar la ruta relativa URL para la BD
-        imagen_ruta = f"/{UPLOAD_FOLDER_URL_REL}/{filename}"
+        imagen_ruta = f"/{UPLOAD_FOLDER_URL_REL}/{filename}" # Ruta relativa URL para BD
 
         app.logger.info(f"Intentando guardar imagen en: {filepath}")
         imagen.save(filepath)
         app.logger.info(f"Imagen guardada exitosamente en: {filepath}")
 
     except Exception as file_error:
-        # Error al intentar guardar el archivo en el servidor
         error_info = traceback.format_exc()
         app.logger.error(f"Error al guardar la imagen: {file_error}\n{error_info}")
-        # Comentar/descomentar si Flask-Mail funciona
         if mail: send_error_email(f"Error al guardar la imagen: {file_error}\n{error_info}")
         flash('Error al guardar la imagen subida en el servidor.', 'error')
-        # No hay archivo que borrar si falló aquí, redirigir directamente
-        return redirect(url_for('admin'))
+        return redirect(url_for('admin')) # No continuar si falla el guardado
 
-    # Si llegamos aquí, la imagen se guardó. Ahora intentamos insertar en BD.
+    # --- 4. Preparar datos y guardar en Base de Datos ---
     conn = None
-    cursor = None
     try:
+        # Convertir genero_id a int DESPUÉS de validar que no es None/vacío
+        genero_id_val = int(genero_id_str)
+
         conn = get_db_connection()
         if conn:
             with conn.cursor() as cursor:
-                # Usar %s para parámetros con PyMySQL
                 sql = """
                     INSERT INTO pelicula
                     (titulo, fecha_estreno, horarios, sinopsis, trailer_url, genero_id, imagen_ruta)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """
-                fecha_estreno_val = request.form.get('fecha_estreno') or None
-                genero_id_val = request.form.get('genero_id') or None
-                if genero_id_val: genero_id_val = int(genero_id_val) # Convertir a int
-
+                # Usar .strip() en los campos de texto al guardar para limpiar espacios extra
                 params = (
-                    request.form.get('titulo'), fecha_estreno_val, request.form.get('horarios'),
-                    request.form.get('sinopsis'), request.form.get('trailer_url'),
-                    genero_id_val, imagen_ruta
+                    titulo.strip(), # Limpiar título
+                    fecha_estreno_val,
+                    horarios.strip(), # Limpiar horarios
+                    sinopsis.strip() if sinopsis else None, # Limpiar sinopsis si existe
+                    trailer_url.strip() if trailer_url else None, # Limpiar URL si existe
+                    genero_id_val,
+                    imagen_ruta # Ya contiene la ruta de la imagen guardada
                 )
                 cursor.execute(sql, params)
-            conn.commit() # Commit DESPUÉS del bloque 'with cursor'
+            conn.commit() # Commit FUERA del 'with cursor'
             flash('Película agregada correctamente.', 'success')
         else:
             # Falló get_db_connection()
             flash('Error conexión BD. No se pudo agregar la película.', 'error')
-            # --- BLOQUE CORREGIDO ---
             # Intentar borrar la imagen porque la conexión falló DESPUÉS de guardarla
             if filepath:
                 try:
@@ -377,31 +403,32 @@ def agregar_pelicula():
                     app.logger.info(f"Imagen {filepath} borrada por fallo de conexión BD.")
                 except Exception as del_err:
                     app.logger.error(f"Error borrando {filepath} tras fallo conexión BD: {del_err}")
-            # --- FIN BLOQUE CORREGIDO ---
 
-    except (pymysql.Error, ValueError) as db_error: # Capturar error PyMySQL y ValueError de int()
+    # Capturar errores de BD (PyMySQL) o de conversión de genero_id (ValueError)
+    except (pymysql.Error, ValueError) as db_val_error:
         error_info = traceback.format_exc()
-        app.logger.error(f"Error BD/Valor al agregar película: {db_error}\n{error_info}")
-        if mail: send_error_email(...)
-        flash('Error al guardar la película en la base de datos.', 'error')
+        # Distinguir si el error fue de conversión o de BD
+        if isinstance(db_val_error, ValueError):
+             flash('ID de género inválido.', 'error')
+             app.logger.error(f"Error de valor (prob. genero_id) al agregar película: {db_val_error}\n{error_info}")
+        else: # pymysql.Error
+             flash('Error al guardar la película en la base de datos.', 'error')
+             app.logger.error(f"Error BD al agregar película: {db_val_error}\n{error_info}")
+             if mail: send_error_email(...) # Notificar error de BD
 
-        # --- BLOQUE CORREGIDO ---
-        # Intentar borrar la imagen si falló la inserción/commit en BD
+        # Intentar borrar la imagen si falló la inserción/commit en BD o conversión
         if filepath:
             try:
                 os.remove(filepath)
-                app.logger.info(f"Imagen {filepath} borrada por fallo de BD al agregar.")
+                app.logger.info(f"Imagen {filepath} borrada por fallo de BD/Valor al agregar.")
             except Exception as delete_err:
-                app.logger.error(f"No se pudo eliminar imagen {filepath} tras fallo de BD: {delete_err}")
-        # --- FIN BLOQUE CORREGIDO ---
+                app.logger.error(f"No se pudo eliminar imagen {filepath} tras fallo de BD/Valor: {delete_err}")
 
     except Exception as e: # Otros errores inesperados
         error_info = traceback.format_exc()
         app.logger.error(f"Error inesperado al agregar película: {e}\n{error_info}")
         if mail: send_error_email(...)
         flash('Ocurrió un error inesperado al agregar la película.', 'error')
-
-        # --- BLOQUE CORREGIDO ---
         # Intentar borrar la imagen si falló por otra razón
         if filepath:
             try:
@@ -409,18 +436,14 @@ def agregar_pelicula():
                 app.logger.info(f"Imagen {filepath} borrada por error inesperado.")
             except Exception as delete_err:
                 app.logger.error(f"No se pudo eliminar imagen {filepath} tras error inesperado: {delete_err}")
-        # --- FIN BLOQUE CORREGIDO ---
 
     finally:
-         # Asegurarse de cerrar la conexión si se abrió
-         if conn and conn.open:
-             conn.close()
+        # Asegurarse de cerrar la conexión si se abrió
+        if conn and conn.open:
+            conn.close()
 
     # Redirigir a admin después de éxito o error manejado
-    # Este redirect debe estar fuera del finally, pero alcanzarse si hubo éxito o error
     return redirect(url_for('admin'))
-
-
 @app.route('/admin/peliculas/editar/<int:id>', methods=['GET', 'POST'])
 @login_required # Aplicar decorador
 def editar_pelicula(id):
